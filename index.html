@@ -16,7 +16,7 @@
 <meta name="description" content="Store Management System — Siwakhola Hydropower Project 9.3MW">
 
 <!-- PWA Manifest (inline) -->
-<link rel="manifest" href="/hydrostorepro/manifest.json">;charset=utf-8,{
+<link rel="manifest" href="data:application/json;charset=utf-8,{
   &quot;name&quot;: &quot;HydroStorePro — Siwa Hydropower&quot;,
   &quot;short_name&quot;: &quot;HydroStore&quot;,
   &quot;description&quot;: &quot;Store Management System — Siwakhola Hydropower Project&quot;,
@@ -12434,7 +12434,9 @@ if ('serviceWorker' in navigator) {
     });
   `;
   try {
-  navigator.serviceWorker.register('/hydrostorepro/sw.js')
+  const blob = new Blob([swCode], { type: 'application/javascript' });
+    const swURL = URL.createObjectURL(blob);
+    navigator.serviceWorker.register(swURL)
       .then(() => console.log('HydroStorePro SW registered'))
       .catch(() => {});
   } catch(e) {}
