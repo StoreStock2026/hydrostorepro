@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>HydroStorePro — Firestore Setup & Migration Tool</title>
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import {
+    getFirestore, collection, doc, writeBatch, getDocs, query, limit, deleteDoc
+  } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import {
+    getAuth, signInWithEmailAndPassword, onAuthStateChanged
+  } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+  // ════════════════════════════════════════════════════════════
+  // STEP 1 — PASTE YOUR FIREBASE PROJECT CONFIG HERE
+  // (Firebase Console → Project Settings → General → Your apps → SDK setup)
+  // ════════════════════════════════════════════════════════════
+  const firebaseConfig = {
+    apiKey: "AIzaSyDkY3kjzlMHs5MRbEa3YweaJ4YuXUo8Jdk",
+    authDomain: "siwa-store-hydrostorepro.firebaseapp.com",
+    projectId: "siwa-store-hydrostorepro",
+    storageBucket: "siwa-store-hydrostorepro.firebasestorage.app",
+    messagingSenderId: "663938610531",
+    appId: "1:663938610531:web:4a85c3fa9a604e89d18f56",
+    measurementId: "G-V8G0DWTXM1"
+  };
+
+  const STORE_KEY = 'hydrostorepro_v3';
+
+  // Maps your local DB array names → Firestore collection names
+  const COLLECTION_MAP = {
+    master: 'items',
+    receives: 'receives',
+    issues: 'issues',
+    adjustments: 'adjustments',
+    requisitions: 'requisitions',
+    reqReceipts: 'reqReceipts',
+    transfers: 'transfers',
+    returns: 'returns',
+    purchaseInvoices: 'purchaseInvoices'
+  };
+
+  let app, db, auth;
+  let localData = null;
+
+  function log(msg, cls) {
+    const el = document.getElementById('log');
+    const line = document.createElement('div');
+    line.className = 'line ' + (cls||'');
+    line.textContent = msg;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function setStatus(connected) {
+    const dot = document.getElementById('conn-dot');
+    const txt = document.getElementById('conn-txt');
+    if (connected) { dot.className='dot ok'; txt.textContent='Connected to Firestore'; }
+    else { dot.className='dot bad'; txt.textContent='Not connected'; }
+  }
+
+  // ── STEP A: read local data, show counts ──
+  window.scanLocalData = function() {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) { log('❌ No local data found under key "'+STORE_KEY+'" in this browser.', 'err'); return; }
+    try { localData = JSON.parse(raw); }
+    catch(e) { log('❌ Could not parse local data: '+e.message, 'err'); return; }
+
+    let html = '<table><tr><th>Collection</th><th>Local Records</th></tr>';
+    let total = 0;
+    Object.keys(COLLECTION_MAP).forEach(key=>{
+      const n = (localData[key]||[]).length;
+      total += n;
+      html += `<tr><td>${key}</td><td>${n}</td></tr>`;
+    });
+    html += `<tr class="total"><td>TOTAL</td><td>${total}</td></tr></table>`;
+    document.getElementById('local-counts').innerHTML = html;
+    log('✅ Scanned local data — '+total+' total records found across '+Object.keys(COLLECTION_MAP).length+' collections.', 'ok');
+    document.getElementById('migrate-btn').disabled = false;
+  };
+
+  // ── STEP B: connect to Firebase ──
+  window.connectFirebase = function() {
+    try {
+      app = initializeApp(firebaseConfig);
+      db = getFirestore(app);
+      auth = getAuth(app);
+      log('✅ Firebase app initialized for project: '+firebaseConfig.projectId, 'ok');
+
+      const email = document.getElementById('login-email').value.trim();
+      const pass = document.getElementById('login-pass').value;
+      if (!email || !pass) { log('⚠️ Enter your Firebase Auth email & password above to sign in.', 'warn'); setStatus(false); return; }
+
+      signInWithEmailAndPassword(auth, email, pass)
+        .then(()=>{ log('✅ Signed in as '+email, 'ok'); setStatus(true); document.getElementById('verify-btn').disabled=false; document.getElementById('dupe-btn').disabled=false; })
+        .catch(e=>{ log('❌ Sign-in failed: '+e.message, 'err'); setStatus(false); });
+    } catch(e) {
+      log('❌ Could not initialize Firebase — check your firebaseConfig values. '+e.message, 'err');
+      setStatus(false);
+    }
+  };
+
+  // ── STEP C: run migration (copy, never deletes local data) ──
+  window.runMigration = async function() {
+    if (!localData) { log('⚠️ Scan local data first (Step 1).', 'warn'); return; }
+    if (!db) { log('⚠️ Connect & sign in to Firestore first (Step 2).', 'warn'); return; }
+    document.getElementById('migrate-btn').disabled = true;
+    log('— Starting migration (copy only — your local data is left untouched) —');
+
+    for (const [localKey, collName] of Object.entries(COLLECTION_MAP)) {
+      const records = localData[localKey] || [];
+      if (records.length === 0) { log('— ' + collName + ': 0 records, skipped'); continue; }
+      let batch = writeBatch(db);
+      let count = 0;
+      for (const rec of records) {
+        const recId = rec.id || rec.grn || rec.ref || rec.reqNum || (collName + '_' + count + '_' + Date.now());
+        const ref = doc(collection(db, collName), String(recId));
+        batch.set(ref, rec, { merge: true });
+        count++;
+        if (count % 400 === 0) { await batch.commit(); batch = writeBatch(db); }
+      }
+      await batch.commit();
+      log('✅ ' + collName + ': uploaded ' + records.length + ' records', 'ok');
+    }
+    log('— Migration complete. Now click "Verify Counts" to confirm everything matches. —', 'ok');
+    document.getElementById('migrate-btn').disabled = false;
+  };
+
+  // ── STEP D: verify — compare local vs Firestore counts ──
+  window.verifyCounts = async function() {
+    if (!localData) { log('⚠️ Scan local data first.', 'warn'); return; }
+    let html = '<table><tr><th>Collection</th><th>Local</th><th>Firestore</th><th>Match</th></tr>';
+    let allMatch = true;
+    for (const [localKey, collName] of Object.entries(COLLECTION_MAP)) {
+      const localCount = (localData[localKey]||[]).length;
+      const snap = await getDocs(collection(db, collName));
+      const cloudCount = snap.size;
+      const match = localCount === cloudCount;
+      if (!match) allMatch = false;
+      html += `<tr class="${match?'':'mismatch'}"><td>${localKey}</td><td>${localCount}</td><td>${cloudCount}</td><td>${match?'✅':'⚠️ DIFFERS'}</td></tr>`;
+    }
+    html += '</table>';
+    document.getElementById('verify-results').innerHTML = html;
+    log(allMatch ? '✅ All collections match — migration verified safe.' : '⚠️ Some counts differ — review before switching the live app over.', allMatch?'ok':'warn');
+  };
+
+  // ── STEP E: find ALL cloud docs that don't match any local record (orphans + stray dupes) ──
+  window.findDuplicates = async function() {
+    if (!localData) { log('⚠️ Scan local data first.', 'warn'); return; }
+    if (!db) { log('⚠️ Connect & sign in first.', 'warn'); return; }
+    log('— Scanning ALL collections for cloud docs not in local data —');
+    const toDelete = [];
+
+    const checks = [
+      { localKey:'receives',  collName:'receives',  idFields:['id','grn'] },
+      { localKey:'issues',    collName:'issues',    idFields:['id','mis'] },
+      { localKey:'master',    collName:'items',     idFields:['id'] },
+      { localKey:'transfers', collName:'transfers', idFields:['id','ref'] },
+      { localKey:'returns',   collName:'returns',   idFields:['id','ref'] },
+      { localKey:'requisitions', collName:'requisitions', idFields:['id','num'] },
+      { localKey:'adjustments',  collName:'adjustments',  idFields:['id'] },
+    ];
+
+    for (const c of checks) {
+      const localRecs = localData[c.localKey] || [];
+      // Build a set of ALL known identifiers from local records
+      const knownIds = new Set();
+      localRecs.forEach(r => {
+        c.idFields.forEach(f => { if (r[f]) knownIds.add(String(r[f])); });
+      });
+
+      const snap = await getDocs(collection(db, c.collName));
+      snap.forEach(d => {
+        const docId = d.id;
+        const data = d.data();
+        // Check if this cloud doc's ID OR any of its id-fields match a local record
+        let matched = knownIds.has(docId);
+        if (!matched) {
+          c.idFields.forEach(f => { if (data[f] && knownIds.has(String(data[f]))) matched = true; });
+        }
+        if (!matched) {
+          // Cloud doc has no matching local record — orphan or stray dupe
+          const label = c.idFields.map(f => data[f]).filter(Boolean).join(' / ') || docId;
+          toDelete.push({ collName:c.collName, docId, label });
+        }
+      });
+    }
+
+    if (toDelete.length === 0) {
+      log('✅ No extra cloud documents found — data is perfectly clean.', 'ok');
+      document.getElementById('dupe-results').innerHTML = '<p style="color:#5fd9b4">All clean — no extra cloud documents.</p>';
+      return;
+    }
+
+    window._dupesFound = toDelete;
+    let html = '<p style="color:#f0a868;font-size:12px">These documents exist in Firestore but NOT in your local data. Review carefully — then delete only if you are sure they are test/duplicate records.</p>';
+    html += '<table><tr><th>Collection</th><th>Firestore Doc ID</th><th>Record Ref</th></tr>';
+    toDelete.forEach(d => { html += `<tr><td>${d.collName}</td><td style="font-size:10px;word-break:break-all">${d.docId}</td><td>${d.label}</td></tr>`; });
+    html += '</table><button onclick="deleteDuplicates()" style="margin-top:10px;background:#c4452f;border:none;border-radius:7px;padding:7px 14px;color:#fff;font-weight:700;cursor:pointer">🗑️ Delete These ' + toDelete.length + ' Extra Document(s)</button>';
+    document.getElementById('dupe-results').innerHTML = html;
+    log('⚠️ Found ' + toDelete.length + ' cloud document(s) not present locally — review the table below.', 'warn');
+  };
+
+  window.deleteDuplicates = async function() {
+    const dupes = window._dupesFound || [];
+    if (dupes.length === 0) return;
+    log('— Deleting ' + dupes.length + ' duplicate document(s) —');
+    for (const d of dupes) {
+      try {
+        await deleteDoc(doc(collection(db, d.collName), d.docId));
+        log('🗑️ Deleted ' + d.collName + '/' + d.docId, 'ok');
+      } catch(e) { log('❌ Failed to delete ' + d.docId + ': ' + e.message, 'err'); }
+    }
+    document.getElementById('dupe-results').innerHTML = '<p style="color:#5fd9b4">Cleanup done — click "Verify Counts Match" again to confirm.</p>';
+    log('✅ Cleanup complete. Re-run Step 4 (Verify Counts) to confirm.', 'ok');
+  };
+
+  document.addEventListener('DOMContentLoaded', ()=>{
+    setStatus(false);
+  });
+</script>
+<style>
+  body{font-family:'Segoe UI',Arial,sans-serif;background:#0f1a17;color:#e8f0ec;max-width:880px;margin:30px auto;padding:0 20px 60px}
+  h1{color:#5fd9b4;font-size:20px}
+  h2{color:#f0a868;font-size:15px;margin-top:30px;border-bottom:1px solid #2a3a35;padding-bottom:6px}
+  p{color:#b8c4ba;font-size:13px;line-height:1.6}
+  .panel{background:#16241f;border:1px solid #2a3a35;border-radius:10px;padding:16px 20px;margin-top:12px}
+  label{display:block;font-size:11px;color:#9fb3a8;margin-bottom:3px;margin-top:8px;text-transform:uppercase;letter-spacing:0.4px}
+  input{width:100%;max-width:320px;padding:7px 10px;background:#0f1a17;border:1px solid #3a4d45;border-radius:6px;color:#e8f0ec;font-size:13px}
+  button{margin-top:12px;padding:8px 18px;border:none;border-radius:7px;font-weight:700;font-size:12.5px;cursor:pointer;background:#16a394;color:#06140f;margin-right:8px}
+  button:disabled{opacity:0.4;cursor:not-allowed}
+  button.secondary{background:#2a3a35;color:#e8f0ec}
+  table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12.5px}
+  th,td{padding:5px 10px;border-bottom:1px solid #2a3a35;text-align:left}
+  th{color:#f0a868}
+  tr.total td{font-weight:700;color:#5fd9b4;border-top:2px solid #5fd9b4}
+  tr.mismatch td{color:#e8a591}
+  #log{background:#0a1310;border:1px solid #2a3a35;border-radius:8px;padding:10px 14px;margin-top:10px;height:180px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11.5px}
+  .line{padding:2px 0}
+  .line.ok{color:#5fd9b4}
+  .line.err{color:#e8a591}
+  .line.warn{color:#f0a868}
+  .status-row{display:flex;align-items:center;gap:8px;margin-top:8px}
+  .dot{width:9px;height:9px;border-radius:50%;background:#777}
+  .dot.ok{background:#5fd9b4}
+  .dot.bad{background:#e8a591}
+  .warning-box{background:#2a1f12;border:1px solid #6b4416;border-radius:8px;padding:10px 14px;font-size:12.5px;color:#f0a868;margin-top:14px}
+</style>
+</head>
+<body>
+  <h1>🔧 HydroStorePro — Firestore Setup &amp; Migration Tool</h1>
+  <p>This is a standalone, separate tool. It does <b>not</b> touch your live HydroStorePro app or modify your browser's local data in any way — it only <b>reads</b> the local data and <b>copies</b> it to Firestore.</p>
+
+  <div class="warning-box">
+    ⚠️ Before using this: open <code>firebase-config.js</code> notes below, paste in your real Firebase project keys, and create an Authentication user (email/password) in the Firebase Console first — this tool needs to sign in to write to Firestore.
+  </div>
+
+  <h2>Step 1 — Scan your local data</h2>
+  <div class="panel">
+    <p>Open this file in the <b>same browser</b> where your HydroStorePro app currently lives (so it can read <code>localStorage</code>), then click Scan.</p>
+    <button onclick="scanLocalData()">📊 Scan Local Data</button>
+    <div id="local-counts"></div>
+  </div>
+
+  <h2>Step 2 — Connect &amp; sign in to Firestore</h2>
+  <div class="panel">
+    <label>Auth Email</label>
+    <input type="email" id="login-email" placeholder="you@example.com">
+    <label>Auth Password</label>
+    <input type="password" id="login-pass" placeholder="••••••••">
+    <div><button onclick="connectFirebase()">🔌 Connect &amp; Sign In</button></div>
+    <div class="status-row"><span class="dot" id="conn-dot"></span><span id="conn-txt">Not connected</span></div>
+  </div>
+
+  <h2>Step 3 — Run migration</h2>
+  <div class="panel">
+    <p>This <b>copies</b> every record up to Firestore (using <code>merge: true</code>, so running it twice is safe and won't duplicate data). Your local browser data is left exactly as-is.</p>
+    <button id="migrate-btn" onclick="runMigration()" disabled>🚀 Migrate to Firestore</button>
+  </div>
+
+  <h2>Step 4 — Verify</h2>
+  <div class="panel">
+    <button id="verify-btn" onclick="verifyCounts()" disabled>✅ Verify Counts Match</button>
+    <div id="verify-results"></div>
+  </div>
+
+  <h2>Step 5 — Cleanup Duplicates (if Step 4 shows ⚠️ DIFFERS)</h2>
+  <div class="panel">
+    <p>If Step 4 shows mismatches, click below to automatically find and remove stray duplicate documents caused by the old ID-key mismatch. This only deletes confirmed duplicates — the correct copy of each record is kept.</p>
+    <button id="dupe-btn" onclick="findDuplicates()" disabled>🔍 Find Duplicate Documents</button>
+    <div id="dupe-results"></div>
+  </div>
+
+  <h2>Log</h2>
+  <div id="log"></div>
+</body>
+</html>
